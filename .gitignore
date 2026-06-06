@@ -1,0 +1,18 @@
+# Credentials — NEVER commit real keys
+.env
+.env.local
+.nomic/credentials
+
+# Local output (reports vary per user)
+output/*.md
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+venv/
+rag-env/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,116 @@
+#!/home/sak/.hermes/rag-env/bin/python3
+"""
+Ingest new entries into updates-v1 collection.
+Append-only — never modifies original 4 collections.
+
+Usage:
+  rag-ingest-updates --title "HbA1c 2024 ADA update" --content "ADA lowered diabetes diagnostic threshold from 6.5% to 6.3% in 2024..." --source "PubMed PMID: 38245678" --tag "gap-analysis"
+  rag-ingest-updates --file ./findings.json  # batch from JSON file
+"""
+
+import argparse, json, os, sys, uuid
+from datetime import datetime, timezone
+
+def _resolve_qdrant_creds():
+    QDRANT_URL, QDRANT_API_KEY = "", ""
+    try:
+        with open(os.path.expanduser("~/.hermes/.env")) as f:
+            for line in f:
+                if line.startswith("QDRANT_URL="):
+                    QDRANT_URL = line.split("=", 1)[1].strip()
+                elif line.startswith("QDRANT_API_KEY="):
+                    QDRANT_API_KEY = line.split("=", 1)[1].strip()
+    except Exception as e:
+        raise RuntimeError(f"Could not read ~/.hermes/.env: {e}")
+    return QDRANT_URL, QDRANT_API_KEY
+
+
+def ingest_entry(title: str, content: str, source: str = "", tags: str = "", collection: str = "updates-v1"):
+    """Add one entry to updates-v1"""
+    from qdrant_client import QdrantClient
+    from qdrant_client.http import models
+    import nomic
+
+    url, key = _resolve_qdrant_creds()
+    client = QdrantClient(url=url, api_key=key)
+
+    # Embed with Nomic
+    nomic.login(os.environ.get("NOMIC_API_KEY") or _get_nomic_key())
+    from nomic import embed
+
+    response = embed.text(
+        texts=[content],
+        model="nomic-embed-text-v1.5",
+        task_type="search_document",
+    )
+    vector = response["embeddings"][0]
+
+    point_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+
+    payload = {
+        "title": title,
+        "content": content,
+        "source": source,
+        "tags": tags,
+        "ingested_at": now,
+    }
+
+    client.upsert(
+        collection_name=collection,
+        points=[models.PointStruct(id=point_id, vector=vector, payload=payload)],
+    )
+
+    print(f"✅ Ingested: {title} [{tags}] → {collection} ({point_id[:8]}...)")
+    return point_id
+
+
+def _get_nomic_key():
+    try:
+        creds_path = os.path.expanduser("~/.nomic/credentials")
+        with open(creds_path) as f:
+            return json.load(f).get("token", "")
+    except:
+        return os.environ.get("NOMIC_API_KEY", "")
+
+
+def batch_ingest(filepath: str, collection: str = "updates-v1"):
+    """Ingest multiple entries from a JSON file"""
+    with open(filepath) as f:
+        entries = json.load(f)
+
+    if isinstance(entries, dict):
+        entries = [entries]
+
+    ids = []
+    for entry in entries:
+        eid = ingest_entry(
+            title=entry.get("title", "Untitled"),
+            content=entry.get("content", ""),
+            source=entry.get("source", ""),
+            tags=entry.get("tags", ""),
+            collection=collection,
+        )
+        ids.append(eid)
+
+    print(f"\n📊 Batch complete: {len(ids)} entries added to {collection}")
+    return ids
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Ingest entries into an updates collection (updates-v1 or updates-v2)")
+    parser.add_argument("--title", help="Entry title")
+    parser.add_argument("--content", help="Entry content/text")
+    parser.add_argument("--source", default="", help="Source (DOI, PMID, URL)")
+    parser.add_argument("--tag", default="general", help="Tag (gap-analysis, audit, note, literature)")
+    parser.add_argument("--collection", default="updates-v1", help="Target collection (updates-v1 or updates-v2)")
+    parser.add_argument("--file", help="JSON file with batch entries")
+
+    args = parser.parse_args()
+
+    if args.file:
+        batch_ingest(args.file, collection=args.collection)
+    elif args.title and args.content:
+        ingest_entry(args.title, args.content, args.source, args.tag, collection=args.collection)
+    else:
+        parser.print_help()

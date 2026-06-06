@@ -1,0 +1,282 @@
+#!/bin/bash
+# mega-rag — Cross-collection Diagnostic Synthesizer (Workflow #17)
+# Intelligently selects which RAG collections to query based on your topic
+# Always fetches PubMed abstracts, never just titles
+#
+# Usage:
+#   mega-rag --fast "IGF-1 stability in blood samples"
+#   mega-rag "HbA1c diagnostic thresholds 2025"
+#   mega-rag --all "cardiac troponin in athletes"
+#
+# Collection selection logic:
+#   - Keywords: lab, analyte, enzyme, biomarker, etc. → biochem-v1
+#   - Keywords: disease, diagnosis, treatment, etc. → harrison-22nd
+#   - Keywords: exercise, sport, athlete, nutrition → sports-medicine
+#   - Keywords: protocol, SOP, procedure, test → vdc
+#   - Always checks updates-v1 for recent findings
+
+set -e
+
+QUERY=""
+MODE="smart"  # smart | all | fast
+
+for arg in "$@"; do
+    case "$arg" in
+        --all|-a) MODE="all" ;;
+        --fast|-f) MODE="fast" ;;
+        *) QUERY="$QUERY $arg" ;;
+    esac
+done
+
+QUERY=$(echo "$QUERY" | xargs)
+if [ -z "$QUERY" ]; then
+    echo "Usage: mega-rag [--fast|--all] \"Your clinical question\""
+    echo ""
+    echo "  --fast   Quick mode: query 1 best collection + PubMed with abstracts"
+    echo "  --all    Full mode: query all 6 collections + PubMed with abstracts"
+    echo "  (default) Smart mode: auto-select 2-4 collections + PubMed with abstracts"
+    echo ""
+    echo "Collection selection is based on query keywords:"
+    echo "  🧬 biochem-v1     → lab values, analytes, biomarkers, enzymes"
+    echo "  📚 harrison-22nd  → diseases, diagnosis, treatment, internal medicine"
+    echo "  🏋️ sports-medicine → exercise, athlete, nutrition, sport"
+    echo "  🏥 vdc            → protocols, SOPs, procedures, test methods"
+    echo "  🆕 updates-v1     → always checked (recent findings)"
+    echo "  📄 updates-v2     → PubMed literature (--all only)"
+    exit 1
+fi
+
+echo "═══════════════════════════════════════════════════"
+echo "  🧬 MEGA-RAG: Cross-Collection Diagnostic Synthesizer"
+echo "  Query: $QUERY"
+echo "═══════════════════════════════════════════════════"
+
+# ── Smart Collection Selection ──────────────────────
+# Keywords map to collections
+select_collections() {
+    local q="$1"
+    local mode="$2"
+    local selections=()
+    
+    if [ "$mode" = "all" ]; then
+        echo "biochem-v1:🧬 Biochem" 
+        echo "harrison-22nd:📚 Harrison"
+        echo "sports-medicine:🏋️ Sports Med"
+        echo "vdc:🏥 VDC"
+        echo "updates-v1:🆕 Updates"
+        echo "updates-v2:📄 PubMed Lit"
+        return
+    fi
+    
+    if [ "$mode" = "fast" ]; then
+        # Pick ONE best collection based on query
+        local ql=$(echo "$q" | tr '[:upper:]' '[:lower:]')
+        
+        # Check for sports keywords
+        for kw in exercise athlete sport nutrition training workout muscle performance; do
+            if echo "$ql" | grep -q "\b${kw}\b"; then
+                echo "sports-medicine:🏋️ Sports Med"
+                return
+            fi
+        done
+        
+        # Check for clinical/lab keywords
+        for kw in lab analyte enzyme biomarker diagnosis disease syndrome treatment therapy patient clinical; do
+            if echo "$ql" | grep -q "\b${kw}\b"; then
+                echo "biochem-v1:🧬 Biochem"
+                return
+            fi
+        done
+        
+        # Check for protocol/SOP keywords
+        for kw in protocol sop procedure method validation reference range; do
+            if echo "$ql" | grep -q "\b${kw}\b"; then
+                echo "vdc:🏥 VDC"
+                return
+            fi
+        done
+        
+        # Default to biochem for clinical/lab queries
+        echo "biochem-v1:🧬 Biochem"
+        return
+    fi
+    
+    # ── Smart mode ── pick 2-3 relevant collections ──
+    local ql=$(echo "$q" | tr '[:upper:]' '[:lower:]')
+    local count=0
+    
+    # Sports keywords
+    for kw in exercise athlete sport nutrition training workout muscle performance running cycling endurance; do
+        if echo "$ql" | grep -q "\b${kw}\b"; then
+            echo "sports-medicine:🏋️ Sports Med"
+            count=$((count + 1))
+            break
+        fi
+    done
+    
+    # Disease/treatment keywords
+    for kw in disease diagnosis syndrome infection inflammation therapy treatment cardiac pulmonary renal hepatic diabetes patient clinical; do
+        if echo "$ql" | grep -q "\b${kw}\b"; then
+            echo "harrison-22nd:📚 Harrison"
+            count=$((count + 1))
+            break
+        fi
+    done
+    
+    # Lab/analyte keywords
+    for kw in lab analyte enzyme biomarker reference range value level concentration assay hormone threshold cutoff limit hba1c glucose creatinine sodium potassium calcium; do
+        if echo "$ql" | grep -q "\b${kw}\b"; then
+            echo "biochem-v1:🧬 Biochem"
+            count=$((count + 1))
+            break
+        fi
+    done
+    
+    # Protocol keywords
+    for kw in protocol sop procedure centrifugation processing storage collection handling preanalytical; do
+        if echo "$ql" | grep -q "\b${kw}\b"; then
+            echo "vdc:🏥 VDC"
+            count=$((count + 1))
+            break
+        fi
+    done
+    
+    # Always add updates-v1 if we have room
+    echo "updates-v1:🆕 Recent findings"
+    
+    # Fallback: if nothing matched, use biochem + Harrison
+    if [ "$count" -eq 0 ]; then
+        echo "biochem-v1:🧬 Biochem"
+        echo "harrison-22nd:📚 Harrison"
+    fi
+}
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+REPORT_DIR="$HOME/.hermes/output/mega-rag"
+mkdir -p "$REPORT_DIR"
+REPORT_FILE="$REPORT_DIR/mega-rag_${TIMESTAMP}.md"
+
+echo "# Mega-RAG Report: $QUERY" > "$REPORT_FILE"
+echo "Generated: $(date)" >> "$REPORT_FILE"
+echo "Mode: $MODE" >> "$REPORT_FILE"
+echo "" >> "$REPORT_FILE"
+
+# ── Query selected collections ──────────────────────
+query_collection() {
+    local coll="$1"
+    local label="$2"
+    local timeout="${3:-20}"
+    
+    echo -n "  🔍 $label..."
+    RESULT=$(timeout "$timeout" ~/.hermes/bin/rag --collection "$coll" --json "$QUERY" 2>/dev/null || echo '{"answer":"(timeout/error)","sources":[]}')
+    echo " done"
+    
+    echo "### $label ($coll)" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+    echo "$RESULT" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(d.get('answer','(empty)'))
+" 2>/dev/null >> "$REPORT_FILE" || echo "(unavailable)" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+}
+
+echo ""
+echo "📚 Querying RAG collections..."
+
+# Read collections from select_collections function
+SELECTIONS=$(select_collections "$QUERY" "$MODE")
+
+# Deduplicate
+SELECTIONS=$(echo "$SELECTIONS" | sort -u)
+
+echo "$SELECTIONS" | while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    COLL="${entry%%:*}"
+    LABEL="${entry##*:}"
+    
+    # Dynamic timeout: largest collections need more time
+    case "$COLL" in
+        vdc)   TIMEOUT=60 ;;  # 135K vectors — needs room
+        *)     TIMEOUT=25 ;;   # standard collections
+    esac
+    
+    query_collection "$COLL" "$LABEL" $TIMEOUT
+done
+
+# ── PubMed with ABSTRACTS ───────────────────────────
+echo ""
+echo "📄 Fetching PubMed papers with abstracts..."
+PM_RESULT=$(timeout 25 python3 ~/.hermes/scripts/research-apis.py pubmed --query "$QUERY" --limit 5 --abstract 2>/dev/null || echo '{"results":[]}')
+
+echo "### 📄 PubMed Literature with Abstracts" >> "$REPORT_FILE"
+echo "" >> "$REPORT_FILE"
+echo "$PM_RESULT" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+results = d.get('results',[])
+if not results:
+    print('(No matching PubMed articles found)')
+else:
+    for i, r in enumerate(results, 1):
+        print(f'**{i}. {r.get(\"title\",\"?\")}**')
+        print(f'   PMID: {r.get(\"pmid\",\"?\")} | {r.get(\"journal\",\"?\")} ({r.get(\"year\",\"?\")})')
+        abstract = r.get('abstract','N/A')
+        if abstract and abstract != 'N/A':
+            # Truncate long abstracts
+            ab = abstract[:400] + '...' if len(abstract) > 400 else abstract
+            print(f'   > {ab}')
+        else:
+            print(f'   (No abstract available)')
+        print(f'   🔗 {r.get(\"url\",\"\")}')
+        print()
+" 2>/dev/null >> "$REPORT_FILE" || echo "(PubMed unavailable)" >> "$REPORT_FILE"
+
+# ── Auto-ingest PubMed into updates-v2 ──────────────────
+echo ""
+echo "📥 Ingesting PubMed results into updates-v2..."
+PM_BATCH="/tmp/mega-rag-pubmed-${TIMESTAMP}.json"
+echo "$PM_RESULT" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+results = d.get('results', [])
+batch = []
+seen_pmids = set()
+for r in results:
+    pmid = r.get('pmid', '').strip()
+    if not pmid or pmid in seen_pmids:
+        continue
+    seen_pmids.add(pmid)
+    title = r.get('title', '?')[:200]
+    abstract = r.get('abstract', '') or ''
+    source = f'PMID: {pmid}' if pmid else ''
+    journal = r.get('journal', '')
+    year = r.get('year', '')
+    content = f'Title: {r[\"title\"]}\nAuthors: {r.get(\"authors\",\"?\")} ({year})\nJournal: {journal}\nPMID: {pmid}\n\n{abstract}'
+    batch.append({'title': title, 'content': content[:5000], 'source': source, 'tags': 'pubmed-mega-rag'})
+with open('${PM_BATCH}', 'w') as f:
+    json.dump(batch, f, indent=2)
+print(f'  📄 {len(batch)} papers to ingest')
+" 2>/dev/null
+
+if [ -s "$PM_BATCH" ]; then
+    INGEST_RESULT=$(~/.hermes/bin/rag-ingest-updates --file "$PM_BATCH" --collection updates-v2 2>&1)
+    echo "$INGEST_RESULT"
+    rm -f "$PM_BATCH"
+fi
+
+# ── Next steps ──────────────────────────────────────────
+echo "" >> "$REPORT_FILE"
+echo "---" >> "$REPORT_FILE"
+echo "*To synthesize all perspectives into a unified clinical recommendation, tell me: 'Synthesize mega-rag report ${TIMESTAMP}'*" >> "$REPORT_FILE"
+
+echo ""
+echo "✅ Report saved: $REPORT_FILE"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Next: Say 'Synthesize mega-rag report ${TIMESTAMP}'"
+echo "to merge all perspectives into one recommendation"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+head -3 "$REPORT_FILE"
+echo "..."
+echo ""

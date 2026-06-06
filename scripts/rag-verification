@@ -1,0 +1,248 @@
+#!/bin/bash
+# rag-verification — RAG-Backed Claim Verifier (Workflow #20)
+# Checks content claims against MULTIPLE RAG collections + PubMed, tags confidence levels
+# Auto-ingests PubMed results into updates-v2
+#
+# Usage:
+#   rag-verification "Creatine improves athletic performance"          # single claim, smart collection selection
+#   rag-verification --collection biochem-v1 "HbA1c > 6.5% = diabetes" # force a specific collection
+#   rag-verification --file outline.txt                                # batch verify from file
+#   rag-verification --interactive                                     # type claims one by one
+#
+# Output: Claim verification report with confidence badges
+
+set -e
+
+MODE="single"
+INPUT=""
+COLLECTION=""
+FORCE_COLLECTION=false
+
+# Parse args
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --file|-f) MODE="file"; INPUT="$2"; shift 2 ;;
+        --interactive|-i) MODE="interactive"; shift ;;
+        --collection|-c) COLLECTION="$2"; FORCE_COLLECTION=true; shift 2 ;;
+        *) 
+            if [ -z "$INPUT" ]; then
+                INPUT="$1"
+                shift
+            else
+                INPUT="$INPUT $1"
+                shift
+            fi
+            ;;
+    esac
+done
+
+REPORT_DIR="$HOME/.hermes/output/rag-verification"
+mkdir -p "$REPORT_DIR"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+REPORT_FILE="$REPORT_DIR/verification_${TIMESTAMP}.md"
+
+echo "═══════════════════════════════════════════════════"
+echo "  ✅ RAG VERIFICATION v2: Multi-Collection Claim Checker"
+echo "═══════════════════════════════════════════════════"
+echo ""
+
+# ── Smart Collection Selection ──────────────────────
+# Maps query keywords to the best collections
+select_collections() {
+    local q="$1"
+    local ql=$(echo "$q" | tr '[:upper:]' '[:lower:]')
+    local selections=()
+
+    # Sports keywords
+    for kw in exercise athlete sport nutrition training workout muscle performance running cycling endurance; do
+        if echo "$ql" | grep -q "\b${kw}\b"; then
+            selections+=("sports-medicine:🏋️ Sports Med")
+            break
+        fi
+    done
+
+    # Disease/treatment keywords
+    for kw in disease diagnosis syndrome infection inflammation therapy treatment cardiac pulmonary renal hepatic diabetes patient; do
+        if echo "$ql" | grep -q "\b${kw}\b"; then
+            selections+=("harrison-22nd:📚 Harrison")
+            break
+        fi
+    done
+
+    # Lab/analyte keywords
+    for kw in lab analyte enzyme biomarker reference range value level concentration assay hormone threshold cutoff limit hba1c glucose creatinine sodium potassium calcium; do
+        if echo "$ql" | grep -q "\b${kw}\b"; then
+            selections+=("biochem-v1:🧬 Biochem")
+            break
+        fi
+    done
+
+    # Protocol keywords
+    for kw in protocol sop procedure centrifugation processing storage collection handling preanalytical; do
+        if echo "$ql" | grep -q "\b${kw}\b"; then
+            selections+=("vdc:🏥 VDC")
+            break
+        fi
+    done
+
+    # Fallback: if nothing matched, use biochem + Harrison
+    if [ ${#selections[@]} -eq 0 ]; then
+        selections+=("biochem-v1:🧬 Biochem")
+        selections+=("harrison-22nd:📚 Harrison")
+    fi
+
+    # Deduplicate
+    printf '%s\n' "${selections[@]}" | sort -u
+}
+
+# ── Verify a single claim ───────────────────────────
+verify_claim() {
+    local claim="$1"
+    local idx="$2"
+    
+    echo "🔍 Checking claim $idx: $claim"
+    
+    # Determine which collection(s) to query
+    local collections_to_query
+    if [ "$FORCE_COLLECTION" = true ]; then
+        collections_to_query=$(echo "$COLLECTION:🔍 $COLLECTION")
+        echo "   Using fixed collection: $COLLECTION"
+    else
+        collections_to_query=$(select_collections "$claim")
+        echo "   Smart selection:"
+        echo "$collections_to_query" | while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            echo "     $entry"
+        done
+    fi
+
+    # Query each collection, take best score
+    local best_score=0
+    local best_answer="No results"
+    local best_sources="[]"
+    local best_label=""
+    local queried_any=false
+
+    while IFS= read -r entry; do
+        [ -z "$entry" ] && continue
+        COLL="${entry%%:*}"
+        LABEL="${entry##*:}"
+        queried_any=true
+
+        RESULT=$(~/.hermes/bin/rag --collection "$COLL" --json "$claim" 2>/dev/null || echo '{"answer": "No results", "sources": []}')
+        
+        SCORE=$(echo "$RESULT" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+sources = d.get('sources',[])
+if sources:
+    print(max(s.get('score',0) for s in sources))
+else:
+    print('0')
+" 2>/dev/null || echo "0")
+        
+        # Track best
+        if [ "$(awk "BEGIN {print ($SCORE > $best_score)}")" = "1" ]; then
+            best_score=$SCORE
+            best_answer=$(echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('answer','No results')[:200])" 2>/dev/null)
+            best_label=$LABEL
+        fi
+    done <<< "$collections_to_query"
+
+    if [ "$queried_any" = false ]; then
+        # Fallback to biochem
+        RESULT=$(~/.hermes/bin/rag --collection biochem-v1 --json "$claim" 2>/dev/null || echo '{"answer": "No results", "sources": []}')
+        best_score=$(echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); s=d.get('sources',[]); print(max((x.get('score',0) for x in s), default=0))")
+        best_answer=$(echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('answer','No results')[:200])")
+        best_label="🧬 Biochem (fallback)"
+    fi
+
+    # Query PubMed
+    PM_RESULT=$(python3 ~/.hermes/scripts/research-apis.py pubmed --query "$claim" --limit 3 2>/dev/null || echo '{"results": []}')
+    PM_COUNT=$(echo "$PM_RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('results',[])))" 2>/dev/null || echo "0")
+    
+    # Auto-ingest PubMed into updates-v2
+    PM_BATCH="/tmp/rag-verification-pubmed-${TIMESTAMP}-${idx}.json"
+    echo "$PM_RESULT" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+results = d.get('results', [])
+batch = []
+seen = set()
+for r in results:
+    pmid = r.get('pmid', '').strip()
+    if not pmid or pmid in seen:
+        continue
+    seen.add(pmid)
+    content = f\"Title: {r.get('title','?')}\nAuthors: {r.get('authors','?')} ({r.get('year','?')})\nJournal: {r.get('journal','?')}\nPMID: {pmid}\n\n{r.get('abstract','')}\"
+    batch.append({'title': (r.get('title','?') or '?')[:200], 'content': content[:5000], 'source': f'PMID: {pmid}', 'tags': 'rag-verification'})
+with open('${PM_BATCH}', 'w') as f:
+    json.dump(batch, f, indent=2)
+" 2>/dev/null
+
+    if [ -s "$PM_BATCH" ]; then
+        ~/.hermes/bin/rag-ingest-updates --file "$PM_BATCH" --collection updates-v2 2>/dev/null || true
+        rm -f "$PM_BATCH"
+    fi
+
+    # Determine badge
+    LOCAL_BADGE=""
+    if [ "$(awk "BEGIN {print ($best_score > 0.5)}")" = "1" ]; then
+        LOCAL_BADGE="✅ RAG-Verified (${best_label})"
+    elif [ "$PM_COUNT" -gt 0 ] 2>/dev/null; then
+        LOCAL_BADGE="📄 Lit-Supported"
+    else
+        LOCAL_BADGE="⚠️ Insufficient Evidence"
+    fi
+    
+    echo "$idx|\"$LOCAL_BADGE\"|\"$claim\"|$best_score|$PM_COUNT" >> "$REPORT_FILE"
+}
+
+# Write header
+echo "# Claim Verification Report" > "$REPORT_FILE"
+echo "Date: $(date)" >> "$REPORT_FILE"
+echo "Mode: $([ "$FORCE_COLLECTION" = true ] && echo "fixed: $COLLECTION" || echo "smart (multi-collection)")" >> "$REPORT_FILE"
+echo "" >> "$REPORT_FILE"
+echo "## Results" >> "$REPORT_FILE"
+echo "| # | Status | Claim | RAG Score | PubMed Matches |" >> "$REPORT_FILE"
+echo "|---|--------|-------|-----------|----------------|" >> "$REPORT_FILE"
+
+COUNT=0
+
+if [ "$MODE" = "file" ] && [ -f "$INPUT" ]; then
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        COUNT=$((COUNT + 1))
+        verify_claim "$line" "$COUNT"
+    done < "$INPUT"
+    
+elif [ "$MODE" = "single" ]; then
+    COUNT=1
+    verify_claim "$INPUT" 1
+    
+elif [ "$MODE" = "interactive" ]; then
+    echo "Enter claims (one per line, empty line to finish):"
+    while IFS= read -r line; do
+        [ -z "$line" ] && break
+        COUNT=$((COUNT + 1))
+        verify_claim "$line" "$COUNT"
+    done
+fi
+
+# Summary
+echo "" >> "$REPORT_FILE"
+echo "## Summary" >> "$REPORT_FILE"
+echo "- Total claims checked: $COUNT" >> "$REPORT_FILE"
+echo "- ✅ RAG-Verified: $(grep -c '✅' "$REPORT_FILE" 2>/dev/null || echo 0)" >> "$REPORT_FILE"
+echo "- 📄 Lit-Supported: $(grep -c '📄' "$REPORT_FILE" 2>/dev/null || echo 0)" >> "$REPORT_FILE"
+echo "- ⚠️ Insufficient: $(grep -c '⚠️' "$REPORT_FILE" 2>/dev/null || echo 0)" >> "$REPORT_FILE"
+
+echo ""
+echo "✅ Report saved: $REPORT_FILE"
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  To generate a carousel from verified claims:"
+echo "  Say 'Generate carousel from $REPORT_FILE'"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+cat "$REPORT_FILE"

@@ -1,0 +1,434 @@
+#!/home/sak/.hermes/rag-env/bin/python3
+"""
+Qdrant RAG Engine — Multi-collection semantic search
+=====================================================
+Flow: User query → Nomic embed → Qdrant search → LLM context → Answer
+
+Usage:
+  rag --collection vdc "Total PSA reference range"
+  rag --collection biochem-v1 --top-k 10 "creatine kinase normal values"
+  rag --collection harrison-22nd --chat
+  rag --json "symptoms of vitamin D deficiency"          # defaults to sports-medicine
+  rag --list                                               # list all collections
+"""
+
+import argparse, json, os, re, sys, textwrap
+from typing import Optional
+
+# ── Qdrant Cloud Config ────────────────────────────────────────────────────
+
+# Read from env vars or ~/.hermes/.env; fallback for backward compat
+QDRANT_URL = os.environ.get("QDRANT_URL") or ""
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or ""
+
+def _resolve_qdrant_creds():
+    global QDRANT_URL, QDRANT_API_KEY
+    if QDRANT_URL and QDRANT_API_KEY:
+        return
+    try:
+        with open(os.path.expanduser("~/.hermes/.env")) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("QDRANT_URL="):
+                    QDRANT_URL = line.split("=", 1)[1]
+                elif line.startswith("QDRANT_API_KEY="):
+                    QDRANT_API_KEY = line.split("=", 1)[1]
+    except Exception:
+        pass
+
+# ── Collection Definitions ──────────────────────────────────────────────────
+
+COLLECTIONS = {
+    "sports-medicine": {
+        "desc": "Sports medicine, nutrition, exercise physiology textbooks",
+        "icon": "🏋️",
+        "system_prompt": """You are a sports medicine & nutrition research assistant. Answer using ONLY the context below from a sports medicine textbook collection.
+
+Rules:
+1. Answer based strictly on retrieved context — do NOT make up information.
+2. If context is insufficient, say so clearly.
+3. Cite source filename and page number inline like [Source 1, p.38].
+4. Use bullet points where helpful.""",
+        "points": 20416,
+    },
+    "biochem-v1": {
+        "desc": "Biochemistry textbook — analytes, enzymes, pathophysiology, kidney disease",
+        "icon": "🧬",
+        "system_prompt": """You are a clinical biochemistry research assistant. Answer using ONLY the context below from a biochemistry textbook collection covering analytes, enzymes, pathophysiology, and lab diagnostics.
+
+Rules:
+1. Answer based strictly on retrieved context — do NOT make up information.
+2. If context is insufficient, say so clearly.
+3. Cite source filename and page number inline like [Source 1, p.875].
+4. Use bullet points where helpful.""",
+        "points": 26303,
+    },
+    "harrison-22nd": {
+        "desc": "Harrison's Principles of Internal Medicine, 22nd edition",
+        "icon": "📚",
+        "system_prompt": """You are an internal medicine research assistant specializing in Harrison's Principles of Internal Medicine (22nd edition). Answer using ONLY the context below.
+
+Rules:
+1. Answer based strictly on retrieved context — do NOT make up information.
+2. If context is insufficient, say so clearly.
+3. Cite source filename and page number inline like [Source 1, p.4038].
+4. Use bullet points where helpful.""",
+        "points": 39460,
+    },
+    "vdc": {
+        "desc": "Vijaya Diagnostic Centre — SOPs, Work Instructions, Test Menus, Reference Textbooks",
+        "icon": "🏥",
+        "system_prompt": """You are a clinical diagnostics assistant with access to Vijaya Diagnostic Centre's SOPs, work instructions, test menus, and reference textbooks. Answer using ONLY the context below.
+
+Rules:
+1. Answer based strictly on retrieved context — do NOT make up information.
+2. If context is insufficient, say so clearly.
+3. Cite the source document name (SOP, reference, etc.) inline like [Source 1].
+4. For test reference ranges, include the department and document type if mentioned.""",
+        "points": 135642,
+    },
+    "updates-v1": {
+        "desc": "Living collection of new findings, gap analyses, audit flags, literature updates, and user notes — appended over time without modifying originals",
+        "icon": "🆕",
+        "system_prompt": """You are a research librarian assistant with access to a continuously growing collection of new findings and literature updates. This collection supplements the 4 ground-truth collections with recent discoveries.
+
+Rules:
+1. Answer based strictly on retrieved context.
+2. Note the date/source of each entry if available.
+3. If content here conflicts with ground-truth collections, flag the discrepancy.
+4. Cite entry source inline like [updates-v1: gap-report-2025-05-26].""",
+        "points": "dynamic",
+    },
+    "updates-v2": {
+        "desc": "Living collection of PubMed literature abstracts fetched through mega-rag queries — curated findings from live PubMed searches on diagnostic/biochemistry topics",
+        "icon": "📄",
+        "system_prompt": """You are a research librarian assistant with access to a curated collection of PubMed literature abstracts. This collection stores recent PubMed papers fetched on-demand through mega-rag queries.
+
+Rules:
+1. Answer based strictly on retrieved context.
+2. Note the PMID and date of each entry if available.
+3. If content here conflicts with ground-truth collections, flag the discrepancy.
+4. Cite entry source inline like [updates-v2: PMID:12345678].""",
+        "points": "dynamic",
+    },
+}
+
+DEFAULT_COLLECTION = "sports-medicine"
+TOP_K = 10
+EMBED_MODEL = "nomic-embed-text-v1.5"
+LLM_MODEL = "deepseek/deepseek-v4-flash"
+LLM_MAX_TOKENS = 4096
+LLM_BASE_URL = "https://openrouter.ai/api/v1"
+
+# ── Nomic Auth ──────────────────────────────────────────────────────────────
+
+_NOMIC_API_KEY = None
+
+def _get_nomic_key() -> str:
+    global _NOMIC_API_KEY
+    if _NOMIC_API_KEY:
+        return _NOMIC_API_KEY
+    # Try env var first
+    key = os.environ.get("NOMIC_API_KEY")
+    if key:
+        _NOMIC_API_KEY = key
+        return key
+    # Try credentials file
+    cred_path = os.path.expanduser("~/.nomic/credentials")
+    try:
+        with open(cred_path) as f:
+            data = json.load(f)
+            key = data.get("token") or data.get("api_key") or ""
+            if key:
+                _NOMIC_API_KEY = key
+                return key
+    except Exception:
+        pass
+    # Try ~/.hermes/.env
+    try:
+        with open(os.path.expanduser("~/.hermes/.env")) as f:
+            for line in f:
+                if line.startswith("NOMIC_API_KEY="):
+                    key = line.split("=", 1)[1].strip()
+                    if key:
+                        _NOMIC_API_KEY = key
+                        return key
+    except Exception:
+        pass
+    raise RuntimeError("Nomic API key not found. Set NOMIC_API_KEY env var or ~/.nomic/credentials")
+
+# ── LLM Key ─────────────────────────────────────────────────────────────────
+
+def _get_llm_key() -> str:
+    try:
+        with open(os.path.expanduser("~/.hermes/.env")) as f:
+            for line in f:
+                if line.startswith("OPENROUTER_API_KEY="):
+                    raw = line.split("=", 1)[1].strip()
+                    if raw and "..." not in raw:
+                        return raw
+        # Fallback: regex full scan
+        with open(os.path.expanduser("~/.hermes/.env")) as f:
+            content = f.read()
+        m = re.search(r'OPENROUTER_API_KEY=(sk-or-v1-\w+)', content)
+        if m:
+            return m.group(1)
+        # Line-based fallback for redacted files
+        with open(os.path.expanduser("~/.hermes/.env"), "rb") as f:
+            raw_bytes = f.read()
+        lines = raw_bytes.decode("utf-8").split("\n")
+        for line in lines:
+            if "sk-or-v1" in line:
+                parts = line.split("=", 1)
+                if len(parts) == 2:
+                    return parts[1]
+    except Exception:
+        pass
+    raise RuntimeError("Could not read OpenRouter key from ~/.hermes/.env")
+
+# ── Clients (lazy) ─────────────────────────────────────────────────────────
+
+_qdrant = None
+_nomic_configured = False
+
+def get_qdrant():
+    global _qdrant
+    if _qdrant is None:
+        _resolve_qdrant_creds()
+        from qdrant_client import QdrantClient
+        if not QDRANT_URL or not QDRANT_API_KEY:
+            raise RuntimeError("Qdrant credentials not found. Set QDRANT_URL and QDRANT_API_KEY in ~/.hermes/.env")
+        _qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    return _qdrant
+
+def get_embeddings(texts: list[str], task_type: str = "search_query") -> list[list[float]]:
+    global _nomic_configured
+    if not _nomic_configured:
+        import json as _json
+        config_dir = os.path.expanduser("~/.nomic")
+        os.makedirs(config_dir, exist_ok=True)
+        key = _get_nomic_key()
+        creds = {"token": key, "tenant": "production", "refresh_token": None, "expires": None}
+        with open(os.path.join(config_dir, "credentials"), "w") as f:
+            _json.dump(creds, f)
+        _nomic_configured = True
+
+    from nomic import embed
+    output = embed.text(texts=texts, model=EMBED_MODEL, task_type=task_type)
+    return output["embeddings"]
+
+def get_llm_response(system_prompt: str, user_content: str) -> str:
+    import requests
+    llm_key = _get_llm_key()
+    headers = {
+        "Authorization": f"Bearer {llm_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://rag-engine.local",
+    }
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": LLM_MAX_TOKENS,
+    }
+    resp = requests.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+# ── Payload extraction helpers ─────────────────────────────────────────────
+
+def extract_text(pl: dict) -> str:
+    """Extract text from either payload format."""
+    return pl.get("chunk_text", "") or pl.get("text", "") or pl.get("content", "") or pl.get("pageContent", "") or ""
+
+def extract_source(pl: dict) -> str:
+    """Extract source name from either format."""
+    src = pl.get("source_pdf", "") or pl.get("source", "") or pl.get("metadata", {}).get("source", "")
+    # Clean up path
+    if "zoho_pdfs" in src or "\\" in src:
+        parts = src.replace("\\", "/").split("/")
+        return parts[-1] if parts else src
+    return src.split("/")[-1] if "/" in src else src
+
+def extract_page(pl: dict) -> str:
+    meta = pl.get("metadata", {}) or {}
+    return str(meta.get("pageNumber", meta.get("page", pl.get("chunk_id", ""))))
+
+def extract_chapter(pl: dict) -> str:
+    meta = pl.get("metadata", {}) or {}
+    return meta.get("chapterTitle", meta.get("chapter", ""))
+
+def extract_metadata_fields(pl: dict) -> dict:
+    """Extra context-specific metadata."""
+    info = {}
+    if pl.get("department"):
+        info["Department"] = pl["department"]
+    if pl.get("category"):
+        info["Category"] = pl["category"]
+    if pl.get("location"):
+        info["Location"] = pl["location"]
+    return info
+
+# ── Search ──────────────────────────────────────────────────────────────────
+
+def search_qdrant(query_vector: list[float], collection_name: str, top_k: int = TOP_K) -> list[dict]:
+    client = get_qdrant()
+    resp = client.query_points(
+        collection_name=collection_name,
+        query=query_vector,
+        limit=top_k,
+        with_payload=True,
+    )
+    results = []
+    for hit in resp.points:
+        pl = hit.payload
+        meta = pl.get("metadata", {}) or {}
+        text = extract_text(pl)
+        source = extract_source(pl)
+        page = extract_page(pl)
+        chapter = extract_chapter(pl)
+        extras = extract_metadata_fields(pl)
+
+        results.append({
+            "score": hit.score,
+            "text": text,
+            "source": source,
+            "page": page,
+            "chapter": chapter,
+            "extras": extras,
+            "raw": {"doc_id": pl.get("doc_id", ""), "chunk_id": pl.get("chunk_id", "")},
+        })
+    return results
+
+def format_context(results: list[dict]) -> str:
+    lines = []
+    for i, r in enumerate(results, 1):
+        lines.append(f"[Source {i}] (score: {r['score']:.4f})")
+        if r["chapter"]:
+            lines.append(f"  Chapter: {r['chapter']}")
+        if r["page"]:
+            lines.append(f"  Page: {r['page']}")
+        lines.append(f"  File: {r['source']}")
+        for k, v in r["extras"].items():
+            lines.append(f"  {k}: {v}")
+        text = r["text"]
+        lines.append(f"  Content: {text[:2000]}")
+        lines.append("")
+    return "\n".join(lines)
+
+# ── RAG Query ───────────────────────────────────────────────────────────────
+
+def rag_query(query: str, collection_name: str = DEFAULT_COLLECTION, top_k: int = TOP_K) -> dict:
+    col = COLLECTIONS[collection_name]
+
+    print(f"🔍 Embedding query into {collection_name}...", file=sys.stderr)
+    query_vec = get_embeddings([query], task_type="search_query")[0]
+
+    pts = col["points"]
+    display_pts = f"{pts:,} pts" if isinstance(pts, int) else str(pts)
+    print(f"📚 Searching {collection_name} ({col['icon']} {display_pts}, top={top_k})...", file=sys.stderr)
+    results = search_qdrant(query_vec, collection_name, top_k)
+
+    if not results:
+        return {"query": query, "answer": "No relevant documents found.", "sources": [], "collection": collection_name}
+
+    context = format_context(results)
+    system_prompt = textwrap.dedent(col["system_prompt"]).strip()
+    system_prompt += f"\n\nCollection: {collection_name}\nDescription: {col['desc']}\n\nContext:\n{context}"
+
+    print(f"🤖 Querying LLM ({LLM_MODEL})...", file=sys.stderr)
+    answer = get_llm_response(system_prompt, query)
+
+    return {
+        "query": query,
+        "answer": answer,
+        "sources": [
+            {"text": r["text"][:300], "source": r["source"], "score": r["score"], "page": r["page"]}
+            for r in results
+        ],
+        "collection": collection_name,
+    }
+
+# ── List Collections ───────────────────────────────────────────────────────
+
+def list_collections():
+    from qdrant_client import QdrantClient
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    live = {c.name for c in client.get_collections().collections}
+
+    print(f"\n{'='*60}")
+    print(f"  Qdrant Cloud — Available Collections")
+    print(f"{'='*60}\n")
+    for cname, col in COLLECTIONS.items():
+        status = "✅" if cname in live else "❌"
+        pts = col["points"]
+        display_pts = f"{pts:,} pts" if isinstance(pts, int) else "living"
+        print(f"  {status} {col['icon']}  {cname}  ({display_pts})")
+        print(f"      {col['desc']}")
+        print(f"      Use: --collection {cname}")
+        print()
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Qdrant RAG Engine — Multi-collection semantic search")
+    parser.add_argument("query", nargs="?", help="Your question")
+    parser.add_argument("--collection", "-c", choices=list(COLLECTIONS.keys()), default=None,
+                        help=f"Collection to search (default: {DEFAULT_COLLECTION})")
+    parser.add_argument("--top-k", type=int, default=TOP_K, help=f"Results to retrieve (default: {TOP_K})")
+    parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--chat", action="store_true", help="Interactive chat mode")
+    parser.add_argument("--list", action="store_true", help="List available collections")
+    args = parser.parse_args()
+
+    if args.list:
+        list_collections()
+        return
+
+    collection = args.collection or DEFAULT_COLLECTION
+
+    if args.chat:
+        col = COLLECTIONS[collection]
+        print("=" * 60)
+        print(f"{col['icon']}  RAG Engine — {collection}")
+        print(f"    {col['desc']}")
+        print(f"    {col['points']:,} points · {EMBED_MODEL}")
+        print("   (type 'quit' to exit)")
+        print("=" * 60)
+        while True:
+            try:
+                q = input("\n❓ ").strip()
+                if not q or q.lower() in ("quit", "exit", "q"):
+                    break
+                result = rag_query(q, collection, args.top_k)
+                print(f"\n💡 Answer:\n{result['answer']}\n")
+                print(f"📄 Sources ({len(result['sources'])}):")
+                for s in result["sources"]:
+                    print(f"  • {s['source']} (score: {s['score']:.4f}, p.{s['page']})")
+            except KeyboardInterrupt:
+                break
+        return
+
+    if not args.query:
+        parser.print_help()
+        print("\nUse --list to see available collections.")
+        return
+
+    result = rag_query(args.query, collection, args.top_k)
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        col = COLLECTIONS[collection]
+        print(f"\n{'='*60}")
+        print(f"{col['icon']}  {collection}  |  {result['query']}")
+        print(f"{'='*60}\n")
+        print(f"💡 Answer:\n{result['answer']}\n")
+        print(f"📄 Sources ({len(result['sources'])}):")
+        for s in result["sources"]:
+            print(f"  • {s['source']} (score: {s['score']:.4f}, p.{s['page']})")
+
+if __name__ == "__main__":
+    main()
